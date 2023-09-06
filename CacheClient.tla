@@ -7,10 +7,12 @@ VARIABLES pc, local_cmd, local_send, recv_pc, send_buf,
     recv_buf, recv_buf_closed, next_req,
     conn_set, recv_current
 
-Cmd == [ req: Nat, resp: Nat, finished: BOOLEAN ]
+Cmd == [ req: Nat, resp: Nat, finished: BOOLEAN, conn: Nat]
 
 Conn == [ write: Seq(Nat), read: Seq(Nat),
     server_closed: BOOLEAN, client_closed: BOOLEAN ]
+
+local_vars == <<pc, local_cmd, local_send>>
 
 recv_vars == <<recv_pc, recv_buf, recv_buf_closed, recv_current>>
 
@@ -19,19 +21,34 @@ ProcState == {"Init", "ReadSendBuf", "PushToRecvBuf",
 
 current_conn == conn_set[Len(conn_set)]
 
+current_conn_index == Len(conn_set)
+
 update_current_conn(c) ==
     conn_set' = [conn_set EXCEPT ![Len(conn_set)] = c]
 
-write_to_current(req) ==
-    update_current_conn([current_conn EXCEPT !.write = Append(@, req)])
 
-read_from_current == current_conn.read[1]
+write_to_current_err(req) ==
+    /\ \/ current_conn.client_closed = TRUE
+       \/ current_conn.server_closed = TRUE
+    /\ UNCHANGED conn_set
+
+
+write_to_current_success(req) ==
+    /\ current_conn.client_closed = FALSE
+    /\ current_conn.server_closed = FALSE
+    /\ Len(current_conn.write) < 2
+    /\ update_current_conn([current_conn EXCEPT !.write = Append(@, req)])
+
+
+write_to_current(req) ==
+    \/ write_to_current_success(req)
+    \/ write_to_current_err(req)
 
 
 TypeOK ==
     /\ pc \in [Proc -> ProcState]
     /\ local_cmd \in [Proc -> Cmd]
-    /\ recv_pc \in {"Init", "RecvReadConn", "Terminated"}
+    /\ recv_pc \in {"Init", "RecvReadConn", "RecvDoCloseConn", "Terminated"}
     /\ recv_buf \in Seq(Proc)
     /\ send_buf \in Seq(Proc)
     /\ next_req \in Nat
@@ -41,7 +58,7 @@ TypeOK ==
     /\ recv_buf_closed \in BOOLEAN
 
 
-newReq(r) == [req |-> r, resp |-> 0, finished |-> FALSE ]
+newReq(r) == [req |-> r, resp |-> 0, finished |-> FALSE, conn |-> 0]
 
 
 newConn ==
@@ -106,11 +123,11 @@ update_cmd_resp(cmd, r) ==
 PushToRecvBuf(p) ==
     /\ pc[p] = "PushToRecvBuf"
     /\ IF recv_buf_closed = FALSE
-        THEN
-            /\ recv_buf' = Append(recv_buf, local_send[p][1])
+        THEN LET cmd_ptr == local_send[p][1] IN
+            /\ local_cmd' = [local_cmd EXCEPT ![cmd_ptr] = [@ EXCEPT !.conn = current_conn_index]]
+            /\ recv_buf' = Append(recv_buf, cmd_ptr)
             /\ goto(p, "WriteToConn")
             /\ UNCHANGED local_send
-            /\ UNCHANGED local_cmd
         ELSE
             /\ local_cmd' = [local_cmd EXCEPT ![local_send[p][1]] = update_cmd_resp(@, 0)]
             /\ removeLocalSend(p)
@@ -160,13 +177,12 @@ RecvDoTerminate ==
     /\ recv_pc = "Init"
     /\ Len(recv_buf) = 0
     /\ recv_buf_closed = TRUE
+    /\ update_current_conn([current_conn EXCEPT !.client_closed = TRUE, !.server_closed = TRUE])
     /\ recv_pc' = "Terminated"
     /\ UNCHANGED <<pc, local_cmd, local_send>>
-    /\ UNCHANGED conn_set
     /\ UNCHANGED send_buf
     /\ UNCHANGED next_req
     /\ UNCHANGED <<recv_buf, recv_current, recv_buf_closed>>
-
 
 
 consume_conn_write(c, r) ==
@@ -184,19 +200,65 @@ MemcachedResponse(i) ==
     /\ UNCHANGED send_buf
 
 
+MemcachedCloseConn(i) ==
+    /\ conn_set[i].server_closed = FALSE
+    /\ conn_set' = [conn_set EXCEPT ![i] = [@ EXCEPT !.server_closed = TRUE]]
+    /\ UNCHANGED local_vars
+    /\ UNCHANGED next_req
+    /\ UNCHANGED send_buf
+    /\ UNCHANGED recv_vars
+
+
+MemcachedResetNewConn ==
+    /\ recv_buf_closed = FALSE
+    /\ current_conn.client_closed = TRUE
+    /\ conn_set' = Append(conn_set, newConn)
+    /\ UNCHANGED local_vars
+    /\ UNCHANGED recv_vars
+    /\ UNCHANGED send_buf
+    /\ UNCHANGED next_req
+
+
+recvConn == conn_set[local_cmd[recv_current].conn]
+
+updateRecvConn(c) ==
+    conn_set' = [conn_set EXCEPT ![local_cmd[recv_current].conn] = c]
+
+recvReadFromCurrent == recvConn.read[1]
+
+recvReadConnNormal ==
+    /\ Len(recvConn.read) > 0
+    /\ recv_pc' = "Init"
+    /\ LET r == recvReadFromCurrent IN
+        /\ local_cmd' = [local_cmd EXCEPT ![recv_current] = update_cmd_resp(@, r)]
+        /\ updateRecvConn([recvConn EXCEPT !.read = Tail(@)])
+
+
+recvReadConnServerClosed ==
+    /\ recvConn.server_closed = TRUE
+    /\ recv_pc' = "RecvDoCloseConn"
+    /\ local_cmd' = [local_cmd EXCEPT ![recv_current] = update_cmd_resp(@, 0)]
+    /\ UNCHANGED conn_set
+
+
 RecvReadConn ==
     /\ recv_pc = "RecvReadConn"
-    /\ Len(current_conn.read) > 0
-    /\ recv_pc' = "Init"
-    /\ LET r == read_from_current IN
-        /\ local_cmd' = [local_cmd EXCEPT ![recv_current] = update_cmd_resp(@, r)]
-        /\ update_current_conn([current_conn EXCEPT !.read = Tail(@)])
+    /\ \/ recvReadConnNormal
+       \/ recvReadConnServerClosed 
     /\ UNCHANGED <<pc, local_send>>
     /\ UNCHANGED send_buf
     /\ UNCHANGED recv_current
     /\ UNCHANGED next_req
     /\ UNCHANGED recv_buf
     /\ UNCHANGED recv_buf_closed
+
+RecvDoCloseConn ==
+    /\ recv_pc = "RecvDoCloseConn"
+    /\ recv_pc' = "Init"
+    /\ updateRecvConn([recvConn EXCEPT !.client_closed = TRUE])
+    /\ UNCHANGED local_vars
+    /\ UNCHANGED <<recv_buf, recv_buf_closed, recv_current>>
+    /\ UNCHANGED <<send_buf, next_req>>
 
 
 DoCloseRecv ==
@@ -225,11 +287,30 @@ Next ==
         \/ WaitResponse(p)
     \/ \E i \in DOMAIN conn_set:
         \/ MemcachedResponse(i)
+        \/ MemcachedCloseConn(i)
     \/ RecvGetNextCmd
     \/ RecvReadConn
     \/ DoCloseRecv
     \/ RecvDoTerminate
+    \/ RecvDoCloseConn
+    \/ MemcachedResetNewConn
     \/ Terminated
+
+FinishWithClosed ==
+    (
+        /\ \A p \in Proc: pc[p] = "Terminated"
+        /\ recv_pc = "Terminated"
+    ) => (\A i \in DOMAIN conn_set:
+            /\ conn_set[i].client_closed = TRUE
+            /\ conn_set[i].server_closed = TRUE)
+
+
+CloseOnlyOnServerClosed ==
+    recv_pc = "RecvDoCloseConn" => (
+        /\ recv_current /= "none"
+        /\ recvConn.server_closed = TRUE
+    )
+
 
 Perms == Permutations(Proc)
 
