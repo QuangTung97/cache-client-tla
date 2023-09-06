@@ -92,30 +92,42 @@ ReadSendBuf(p) ==
     /\ UNCHANGED local_cmd
 
 
+removeLocalSend(p) ==
+    /\ local_send' = [local_send EXCEPT ![p] = Tail(local_send[p])]
+    /\ IF Len(local_send'[p]) = 0
+        THEN goto(p, "WaitResponse")
+        ELSE goto(p, "PushToRecvBuf")
+
+
+update_cmd_resp(cmd, r) ==
+    [cmd EXCEPT !.resp = r, !.finished = TRUE ]
+
+
 PushToRecvBuf(p) ==
     /\ pc[p] = "PushToRecvBuf"
-    /\ recv_buf_closed = FALSE
-    /\ recv_buf' = Append(recv_buf, local_send[p][1])
-    /\ goto(p, "WriteToConn")
-    /\ UNCHANGED local_send
+    /\ IF recv_buf_closed = FALSE
+        THEN
+            /\ recv_buf' = Append(recv_buf, local_send[p][1])
+            /\ goto(p, "WriteToConn")
+            /\ UNCHANGED local_send
+            /\ UNCHANGED local_cmd
+        ELSE
+            /\ local_cmd' = [local_cmd EXCEPT ![local_send[p][1]] = update_cmd_resp(@, 0)]
+            /\ removeLocalSend(p)
+            /\ UNCHANGED recv_buf
     /\ UNCHANGED next_req
     /\ UNCHANGED send_buf
     /\ UNCHANGED <<recv_pc, recv_current>>
     /\ UNCHANGED conn_set
-    /\ UNCHANGED local_cmd
     /\ UNCHANGED recv_buf_closed
 
 
 getCmd(p) == local_cmd[p]
 
-
 WriteToConn(p) ==
     /\ pc[p] = "WriteToConn"
     /\ write_to_current(getCmd(local_send[p][1]).req)
-    /\ local_send' = [local_send EXCEPT ![p] = Tail(local_send[p])]
-    /\ IF Len(local_send'[p]) = 0
-        THEN goto(p, "WaitResponse")
-        ELSE goto(p, "PushToRecvBuf")
+    /\ removeLocalSend(p)
     /\ UNCHANGED next_req
     /\ UNCHANGED recv_vars
     /\ UNCHANGED send_buf
@@ -156,8 +168,6 @@ RecvDoTerminate ==
     /\ UNCHANGED <<recv_buf, recv_current, recv_buf_closed>>
 
 
-update_cmd_resp(cmd, r) ==
-    [cmd EXCEPT !.resp = r, !.finished = TRUE ]
 
 consume_conn_write(c, r) ==
     [c EXCEPT !.write = Tail(@), !.read = Append(@, r + 10) ]
@@ -201,6 +211,10 @@ DoCloseRecv ==
 Terminated ==
     /\ \A p \in Proc: pc[p] = "Terminated"
     /\ recv_pc = "Terminated"
+    /\ UNCHANGED <<pc, local_cmd, local_send>>
+    /\ UNCHANGED <<conn_set, next_req>>
+    /\ UNCHANGED recv_vars
+    /\ UNCHANGED send_buf
 
 Next ==
     \/ \E p \in Proc:
