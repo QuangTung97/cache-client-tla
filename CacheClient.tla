@@ -3,7 +3,8 @@ EXTENDS TLC, Sequences, Naturals
 
 CONSTANTS Proc
 
-VARIABLES pc, local_cmd, local_send, recv_pc, send_buf, recv_buf, next_req,
+VARIABLES pc, local_cmd, local_send, recv_pc, send_buf,
+    recv_buf, recv_buf_closed, next_req,
     conn_set, recv_current
 
 Cmd == [ req: Nat, resp: Nat, finished: BOOLEAN ]
@@ -11,7 +12,7 @@ Cmd == [ req: Nat, resp: Nat, finished: BOOLEAN ]
 Conn == [ write: Seq(Nat), read: Seq(Nat),
     server_closed: BOOLEAN, client_closed: BOOLEAN ]
 
-recv_vars == <<recv_pc, recv_buf, recv_current>>
+recv_vars == <<recv_pc, recv_buf, recv_buf_closed, recv_current>>
 
 ProcState == {"Init", "ReadSendBuf", "PushToRecvBuf", 
     "WriteToConn", "WaitResponse", "Terminated"}
@@ -30,13 +31,14 @@ read_from_current == current_conn.read[1]
 TypeOK ==
     /\ pc \in [Proc -> ProcState]
     /\ local_cmd \in [Proc -> Cmd]
-    /\ recv_pc \in {"Init", "RecvReadConn"}
+    /\ recv_pc \in {"Init", "RecvReadConn", "Terminated"}
     /\ recv_buf \in Seq(Proc)
     /\ send_buf \in Seq(Proc)
     /\ next_req \in Nat
     /\ local_send \in [Proc -> Seq(Proc)]
     /\ conn_set \in Seq(Conn)
     /\ recv_current \in Proc \union {"none"}
+    /\ recv_buf_closed \in BOOLEAN
 
 
 newReq(r) == [req |-> r, resp |-> 0, finished |-> FALSE ]
@@ -58,6 +60,7 @@ Init ==
     /\ local_send = [p \in Proc |-> <<>>]
     /\ conn_set = <<newConn>>
     /\ recv_current = "none"
+    /\ recv_buf_closed = FALSE
 
 
 goto(p, l) ==
@@ -91,7 +94,7 @@ ReadSendBuf(p) ==
 
 PushToRecvBuf(p) ==
     /\ pc[p] = "PushToRecvBuf"
-    /\ Len(recv_buf) < 2
+    /\ recv_buf_closed = FALSE
     /\ recv_buf' = Append(recv_buf, local_send[p][1])
     /\ goto(p, "WriteToConn")
     /\ UNCHANGED local_send
@@ -100,6 +103,7 @@ PushToRecvBuf(p) ==
     /\ UNCHANGED <<recv_pc, recv_current>>
     /\ UNCHANGED conn_set
     /\ UNCHANGED local_cmd
+    /\ UNCHANGED recv_buf_closed
 
 
 getCmd(p) == local_cmd[p]
@@ -117,6 +121,16 @@ WriteToConn(p) ==
     /\ UNCHANGED send_buf
     /\ UNCHANGED local_cmd
 
+WaitResponse(p) ==
+    /\ pc[p] = "WaitResponse"
+    /\ local_cmd[p].finished = TRUE
+    /\ goto(p, "Terminated")
+    /\ UNCHANGED recv_vars
+    /\ UNCHANGED <<send_buf, next_req>>
+    /\ UNCHANGED local_cmd
+    /\ UNCHANGED conn_set
+    /\ UNCHANGED local_send
+
 
 RecvGetNextCmd ==
     /\ recv_pc = "Init"
@@ -128,6 +142,18 @@ RecvGetNextCmd ==
     /\ UNCHANGED next_req
     /\ UNCHANGED conn_set
     /\ UNCHANGED send_buf
+    /\ UNCHANGED recv_buf_closed
+
+RecvDoTerminate ==
+    /\ recv_pc = "Init"
+    /\ Len(recv_buf) = 0
+    /\ recv_buf_closed = TRUE
+    /\ recv_pc' = "Terminated"
+    /\ UNCHANGED <<pc, local_cmd, local_send>>
+    /\ UNCHANGED conn_set
+    /\ UNCHANGED send_buf
+    /\ UNCHANGED next_req
+    /\ UNCHANGED <<recv_buf, recv_current, recv_buf_closed>>
 
 
 update_cmd_resp(cmd, r) ==
@@ -160,6 +186,16 @@ RecvReadConn ==
     /\ UNCHANGED recv_current
     /\ UNCHANGED next_req
     /\ UNCHANGED recv_buf
+    /\ UNCHANGED recv_buf_closed
+
+
+DoCloseRecv ==
+    /\ recv_buf_closed = FALSE
+    /\ recv_buf_closed' = TRUE
+    /\ UNCHANGED <<pc, local_cmd, local_send>>
+    /\ UNCHANGED conn_set
+    /\ UNCHANGED next_req
+    /\ UNCHANGED <<recv_buf, recv_current, recv_pc, send_buf>>
 
 
 Terminated ==
@@ -172,9 +208,13 @@ Next ==
         \/ ReadSendBuf(p)
         \/ PushToRecvBuf(p)
         \/ WriteToConn(p)
+        \/ WaitResponse(p)
+    \/ \E i \in DOMAIN conn_set:
+        \/ MemcachedResponse(i)
     \/ RecvGetNextCmd
     \/ RecvReadConn
-    \/ \E i \in DOMAIN conn_set: MemcachedResponse(i)
+    \/ DoCloseRecv
+    \/ RecvDoTerminate
     \/ Terminated
 
 Perms == Permutations(Proc)
